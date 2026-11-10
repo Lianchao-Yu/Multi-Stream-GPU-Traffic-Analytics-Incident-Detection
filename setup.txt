@@ -1,0 +1,434 @@
+# 任务：执行环境搭建 Plan B（WSL2 + CUDA 13.5 + cuDNN 9.28 + ONNX Runtime 1.31.1 CUDA13）
+
+## 角色与项目背景
+
+你在 `/home/jason/gpu-traffic-analytics` 工作。
+
+项目是一个 C++17 / CUDA C++ 的多路交通视频分析原型，代码尚未开始写，目前只有基础目录结构：
+
+```text
+configs/ data/ docs/ include/traffic/ models/ results/ src/ tests/
+```
+
+请先阅读 `README.md` 的 P0 部分和目录约定。本次任务**只做环境搭建和验证**，不要开始写业务代码，不要大改目录结构。
+
+这个项目最终需要：
+- FFmpeg 解码
+- OpenCV 图像处理
+- ONNX Runtime CUDA Execution Provider 推理
+- 自写 CUDA 预处理 Kernel
+- CMake + Ninja 构建
+- C++17
+
+## 当前环境（执行前先确认）
+
+- 系统：Ubuntu 26.04 LTS，WSL2
+- 内核：6.18.54.1-microsoft-standard-WSL2
+- CPU：20 vCPU
+- 内存：约 7.6 GiB，可用约 5.5 GiB
+- 磁盘：约 937 GiB 可用
+- GPU：NVIDIA GeForce RTX 4060 Laptop GPU，8 GB，计算能力 sm_89
+- 旧 Windows 驱动：555.97（只支持到 CUDA 12.x）
+- 旧 CUDA Toolkit：Ubuntu 包 12.4.131，`nvcc` 在 `/usr/bin/nvcc`
+- 已缺失：ninja、pkg-config、FFmpeg、OpenCV、nlohmann/json、cuDNN、ONNX Runtime、Python pip/venv
+- 当前项目目录只保留了基础结构，不要随意增加复杂子目录
+
+## 前置条件（必须由用户先在 Windows 侧完成）
+
+1. 在 Windows 侧把 NVIDIA 驱动更新到 **R620 或更新版本**，以支持 CUDA 13.5。
+   - 可以用 NVIDIA App、GeForce Experience 或 NVIDIA 官网驱动下载页。
+   - 建议选 Studio Driver，稳定性更好。
+2. 更新后在 PowerShell 执行：
+
+```powershell
+wsl --shutdown
+```
+
+3. 重新打开 WSL 后确认：
+
+```bash
+nvidia-smi
+```
+
+必须满足：
+- Driver Version >= 580（建议 R620+）
+- `nvidia-smi` 显示的 CUDA Version >= 13.0
+
+如果驱动仍低于 580，或 CUDA Version 仍显示 12.x：
+- **停止执行**
+- 提示用户先更新 Windows 驱动并重启 WSL
+- 不要在 WSL 内安装 Linux NVIDIA 驱动
+- 不要继续 CUDA 13 安装
+
+## 本次目标
+
+完成 Plan B 全套环境安装和验证：
+
+- CUDA Toolkit 13.5
+- cuDNN 9.28（CUDA 13 版）
+- ONNX Runtime 1.31.1 CUDA13 C++ 包
+- FFmpeg / OpenCV / nlohmann-json / Ninja / pkg-config
+- Python venv（仅用于生成和检查 ONNX 模型）
+- 跑通 CUDA Smoke Test、FFmpeg/OpenCV 链接测试、ORT CUDA EP 推理测试、CMake+Ninja 构建测试
+- 生成 `/home/jason/gpu-traffic-analytics/docs/environment.md`
+
+**不要安装 onnxruntime-gpu 的 Python 包。** C++ 项目使用 ORT C++ 包；Python 只用于 `onnx` 模型生成/检查。
+
+## 执行步骤
+
+### 1. 预检查
+
+执行并记录：
+
+```bash
+uname -a
+cat /etc/os-release
+nproc
+free -h
+df -h /
+nvidia-smi
+which nvcc
+nvcc --version
+```
+
+确认 sudo 可用。如果 sudo 需要密码，提示用户在终端输入，不要尝试绕过。
+
+### 2. 安装基础依赖
+
+```bash
+sudo apt update
+sudo apt install -y \
+  ninja-build pkg-config ffmpeg \
+  libavformat-dev libavcodec-dev libavutil-dev libswscale-dev \
+  libopencv-dev nlohmann-json3-dev \
+  python3.14-venv python3-pip
+```
+
+安装后验证：
+
+```bash
+ninja --version
+pkg-config --version
+ffmpeg -version | head -3
+pkg-config --modversion libavformat libavcodec libavutil libswscale opencv4
+test -f /usr/include/nlohmann/json.hpp && echo "nlohmann ok"
+```
+
+### 3. 安装 CUDA 13.5 + cuDNN 9.28
+
+```bash
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2604/x86_64/cuda-keyring_1.1-1_all.deb
+sudo dpkg -i cuda-keyring_1.1-1_all.deb
+sudo apt update
+sudo apt install -y cuda-toolkit-13-5 cudnn9-cuda-13-5
+```
+
+约束：
+
+- **不要安装 `cuda` 或 `cuda-drivers` 元包。**
+- **不要在 WSL 中安装 Linux NVIDIA 显卡驱动。**
+- 如果 Ubuntu 现有 CUDA 12.4 包与 13.5 共存，先不要擅自卸载；通过 PATH / CUDAToolkit_ROOT 指定 13.5 即可。确需卸载时先询问用户。
+
+验证：
+
+```bash
+ls -l /usr/local/cuda-13.5
+/usr/local/cuda-13.5/bin/nvcc --version
+ldconfig -p | grep -i cudnn | head
+```
+
+### 4. 配置环境变量
+
+把以下内容幂等地写入 `~/.bashrc`（先检查是否已有相同行，避免重复）：
+
+```bash
+export CUDA_HOME=/usr/local/cuda-13.5
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
+export ONNXRUNTIME_ROOT="$HOME/opt/onnxruntime-1.31.1-cuda13"
+export LD_LIBRARY_PATH="$ONNXRUNTIME_ROOT/lib:$LD_LIBRARY_PATH"
+```
+
+然后：
+
+```bash
+source ~/.bashrc
+which nvcc
+nvcc --version
+```
+
+如果 `which nvcc` 仍指向 `/usr/bin/nvcc`（Ubuntu 12.4）：
+
+- 调整 PATH，让 `/usr/local/cuda-13.5/bin` 优先
+- 不要直接删除系统 CUDA 包，除非用户明确同意
+- 后续 CMake 显式设置 `CUDAToolkit_ROOT=/usr/local/cuda-13.5`
+
+### 5. 安装 ONNX Runtime 1.31.1 CUDA13
+
+```bash
+mkdir -p "$HOME/opt"
+cd "$HOME/opt"
+wget https://github.com/microsoft/onnxruntime/releases/download/v1.31.1/onnxruntime-linux-x64-gpu_cuda13-1.31.1.tgz
+sha256sum onnxruntime-linux-x64-gpu_cuda13-1.31.1.tgz
+tar xzf onnxruntime-linux-x64-gpu_cuda13-1.31.1.tgz
+```
+
+确认目录内容：
+
+```bash
+ls "$ONNXRUNTIME_ROOT/include"
+ls "$ONNXRUNTIME_ROOT/lib"
+```
+
+至少应包含：
+
+- `onnxruntime_cxx_api.h`
+- `libonnxruntime.so`
+- `libonnxruntime_providers_cuda.so`
+- `libonnxruntime_providers_shared.so`
+
+检查动态库依赖是否缺失：
+
+```bash
+ldd "$ONNXRUNTIME_ROOT/lib/libonnxruntime_providers_cuda.so" | grep "not found" || echo "no missing deps"
+ldd "$ONNXRUNTIME_ROOT/lib/libonnxruntime.so" | grep "not found" || echo "no missing deps"
+```
+
+如果出现 `not found`，保留完整输出，停止并报告，不要继续硬跑。
+
+### 6. Python venv（仅用于 ONNX 模型生成）
+
+```bash
+cd /home/jason/gpu-traffic-analytics
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install numpy onnx
+```
+
+如果 `onnx` 在 Python 3.14 上没有可用 wheel：
+
+- 不要改系统 Python
+- 用 `uv` 创建 Python 3.12 环境：
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv python install 3.12
+uv venv --python 3.12 .venv-onnx
+source .venv-onnx/bin/activate
+uv pip install numpy onnx
+```
+
+最终只需要能生成一个 tiny ONNX 模型。
+
+### 7. CUDA Smoke Test
+
+在 `/tmp/opencode/planB_smoke/` 下创建临时测试，不要污染项目根目录。
+
+`smoke.cu` 要求：
+
+- 调用 `cudaGetDeviceCount`
+- 调用 `cudaGetDeviceProperties`
+- 打印 GPU 名称、`sm_89`、显存大小
+- 跑一个简单 CUDA kernel
+- 同时包含 `<vector>`、`<algorithm>`、`<memory>`、`<string>`，使用 C++17，验证 nvcc 能正确调用 GCC 15
+
+编译运行：
+
+```bash
+nvcc -std=c++17 -arch=sm_89 smoke.cu -o smoke
+./smoke
+```
+
+期望输出类似：
+
+```text
+devices=1
+GPU 0: NVIDIA GeForce RTX 4060 Laptop GPU sm_89 ...
+```
+
+### 8. FFmpeg / OpenCV / JSON 链接 Smoke Test
+
+先确认版本：
+
+```bash
+pkg-config --modversion libavformat libavcodec libavutil libswscale opencv4
+```
+
+然后写一个临时 C++ 程序：
+
+- include FFmpeg 的 `libavformat/avformat.h`、`libavcodec/avcodec.h`
+- include OpenCV 的 `opencv2/opencv.hpp`
+- include `<nlohmann/json.hpp>`
+- 打印 `avformat_version()`、`avcodec_version()`、`CV_VERSION`
+- 构造一个 `nlohmann::json` 并打印
+
+用 `pkg-config --cflags --libs` 或临时 CMake 链接并运行，确认不是只编译头文件，而是真正链接成功。
+
+注意：CMake 4.2 可能对 OpenCV 4.10 里的旧 `cmake_minimum_required` 报策略错误。如果出现，使用：
+
+```bash
+-DCMAKE_POLICY_VERSION_MINIMUM=3.5
+```
+
+记录这个 workaround。
+
+### 9. ONNX Runtime CUDA EP Smoke Test
+
+#### 9.1 生成 tiny ONNX 模型
+
+用 Python `onnx.helper` 生成一个很小的 Conv 或 MatMul 模型，保存到：
+
+```text
+/tmp/opencode/planB_smoke/tiny.onnx
+```
+
+推荐生成一个 `1x3x32x32` 输入的 Conv 模型，这样可以同时验证 CUDA 和 cuDNN。
+
+#### 9.2 写 C++ ORT 测试
+
+C++ 程序要求：
+
+- `Ort::GetAvailableProviders()`，打印所有 provider，确认包含 `CUDAExecutionProvider`
+- 创建 `Ort::SessionOptions`
+- 用 `SessionOptionsAppendExecutionProvider_CUDA` 或 C++ API 的 `AppendExecutionProvider_CUDA` 启用 device 0
+- 设置 `ORT_LOGGING_LEVEL_VERBOSE`，便于确认节点是否被 CUDA EP 接管
+- 加载 `tiny.onnx`
+- 构造输入并运行一次
+- 打印输出维度/前几个值
+
+编译时确保：
+
+```bash
+-I"$ONNXRUNTIME_ROOT/include"
+-L"$ONNXRUNTIME_ROOT/lib" -lonnxruntime
+-Wl,-rpath,"$ONNXRUNTIME_ROOT/lib"
+```
+
+运行前确认：
+
+```bash
+export LD_LIBRARY_PATH="$ONNXRUNTIME_ROOT/lib:$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
+```
+
+验收：
+
+- `GetAvailableProviders()` 包含 `CUDAExecutionProvider`
+- Session 能成功创建并运行
+- 日志中没有未记录的 CPU fallback 关键告警
+- 如果 cuDNN / CUDA 库加载失败，保留完整错误并停止
+
+### 10. CMake + Ninja + CUDA + ORT + OpenCV 工具链 Smoke Test
+
+在 `/tmp/opencode/planB_smoke/cmake_test/` 建一个临时 CMake 工程：
+
+```cmake
+cmake_minimum_required(VERSION 3.24)
+project(planb_smoke LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(CUDAToolkit REQUIRED)
+find_package(OpenCV REQUIRED)
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(FFMPEG REQUIRED libavformat libavcodec libavutil libswscale)
+
+add_executable(planb_smoke main.cpp)
+target_include_directories(planb_smoke PRIVATE
+  ${ONNXRUNTIME_ROOT}/include
+  ${FFMPEG_INCLUDE_DIRS}
+  ${OpenCV_INCLUDE_DIRS}
+)
+target_link_directories(planb_smoke PRIVATE ${ONNXRUNTIME_ROOT}/lib)
+target_link_libraries(planb_smoke PRIVATE
+  onnxruntime
+  ${OpenCV_LIBS}
+  ${FFMPEG_LIBRARIES}
+  CUDA::cudart
+)
+```
+
+`main.cpp` 做最小验证：
+
+- 打印 `cv::getBuildInformation()` 里的版本
+- 打印 FFmpeg 版本
+- 打印 `Ort::GetAvailableProviders()`
+- 可选：运行 tiny.onnx
+
+构建：
+
+```bash
+cmake -S . -B build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CUDA_ARCHITECTURES=89 \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+cmake --build build -j
+./build/planb_smoke
+```
+
+注意：
+
+- 如果 `find_package(CUDAToolkit)` 找到的是 12.4，显式传 `-DCUDAToolkit_ROOT=/usr/local/cuda-13.5`
+- 不要把正式 `CMakeLists.txt` 写进项目根目录，这一步只在临时目录验证工具链
+
+### 11. 生成 docs/environment.md
+
+在已有 `docs/` 目录下创建或更新 `docs/environment.md`，记录：
+
+- 日期
+- OS、WSL 版本、内核、CPU、内存、磁盘
+- Windows NVIDIA 驱动版本
+- CUDA Toolkit 版本、cuDNN 版本
+- ONNX Runtime 版本、下载 URL、SHA256
+- GCC/G++、CMake、Ninja、FFmpeg、OpenCV、nlohmann/json 版本
+- GPU 型号、显存、计算能力
+- 所有 Smoke Test 的命令和结果
+- 已知限制：
+  - WSL 内不安装 Linux NVIDIA 驱动
+  - RTX 4060 Laptop 8GB
+  - WSL 内存约 7.6 GiB
+  - Ubuntu 26.04 + CMake 4.2 的兼容注意点（如有）
+- 下一步建议
+
+只新增/更新这个文档，不做其他目录结构改动。
+
+## 验收标准
+
+全部满足才算成功：
+
+- [ ] `nvidia-smi` Driver Version >= 580，CUDA Version >= 13.0
+- [ ] `nvcc --version` 为 13.5
+- [ ] CUDA Smoke Test 通过，识别到 sm_89
+- [ ] FFmpeg / OpenCV / nlohmann 头文件和链接测试通过
+- [ ] `Ort::GetAvailableProviders()` 包含 `CUDAExecutionProvider`
+- [ ] tiny ONNX 模型在 CUDA EP 上运行成功
+- [ ] 没有未记录的 CPU fallback
+- [ ] CMake + Ninja + CUDA + ORT + OpenCV 临时工程构建并运行成功
+- [ ] `docs/environment.md` 已生成
+- [ ] 最终报告中列出所有版本、命令、结果和警告
+
+## 约束与安全
+
+- 本次只执行 Plan B，不要改走 Plan A。
+- 不要在 WSL 安装 Linux NVIDIA 驱动。
+- 不要安装 `cuda` / `cuda-drivers` 元包。
+- 不要改 `README.md`。
+- 不要创建复杂目录，不要开始写业务代码。
+- 不要从 `/mnt/c` 构建或运行大量视频；项目和大文件放 WSL ext4。
+- 不要删除现有 Ubuntu CUDA 12.4 包，除非用户明确同意。
+- 下载 ORT 包约 259 MB，下载前告知用户。
+- 任何一步失败：保留完整错误信息，停止并报告；不要猜测、不要混用不匹配的 CUDA/cuDNN/ORT 版本。
+- sudo 需要密码时提示用户输入。
+
+## 最终输出
+
+请按以下格式汇报：
+
+1. **执行摘要**：成功 / 失败，卡在哪一步
+2. **版本表**：驱动、CUDA、cuDNN、ORT、GCC、CMake、FFmpeg、OpenCV、Ninja、nlohmann
+3. **Smoke Test 结果**：CUDA / FFmpeg+OpenCV / ORT CUDA EP / CMake+Ninja
+4. **`docs/environment.md` 路径**
+5. **已知问题与 workaround**
+6. **下一步建议**：P0 CMake 工程或 Phase 1 解码
